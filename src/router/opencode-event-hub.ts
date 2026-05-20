@@ -128,6 +128,13 @@ export class OpenCodeEventHub {
   private registered: boolean = false;
   private userMessageIdsBySession = new Map<string, Set<string>>();
 
+  // 空闲超时检测：会话最后一次收到 OpenCode 事件的时间戳
+  // 用于检测 OpenCode 后端因工具参数 JSON parse 失败等原因导致的「流式中断卡死」
+  private lastEventAtBySession = new Map<string, number>();
+  private idleSweepTimer: NodeJS.Timeout | null = null;
+  private static readonly IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+  private static readonly IDLE_SWEEP_INTERVAL_MS = 30_000;
+
   private resolveConversationRoute(
     sessionId: string,
     fallbackConversationId: string
@@ -221,6 +228,79 @@ export class OpenCodeEventHub {
 
     // AI 提问
     opencodeClient.on('questionAsked', (event) => this.handleQuestionAsked(event));
+
+    // 启动空闲超时巡检
+    this.startIdleSweep();
+  }
+
+  // ==================== 空闲超时检测 ====================
+
+  /**
+   * 刷新会话活跃时间戳。每个事件 handler 在拿到 sessionID 后调用一次。
+   */
+  private touchSessionActivity(sessionID: string | undefined | null): void {
+    if (!sessionID) return;
+    this.lastEventAtBySession.set(sessionID, Date.now());
+  }
+
+  private startIdleSweep(): void {
+    if (this.idleSweepTimer) return;
+    this.idleSweepTimer = setInterval(() => {
+      this.sweepIdleSessions().catch(err => {
+        console.error('[OpenCodeEventHub] 空闲巡检失败:', err);
+      });
+    }, OpenCodeEventHub.IDLE_SWEEP_INTERVAL_MS);
+    if (typeof this.idleSweepTimer.unref === 'function') {
+      this.idleSweepTimer.unref();
+    }
+  }
+
+  /**
+   * 巡检所有活跃会话：
+   * - 已结束（buffer 不存在或非 running）→ 清理记录；
+   * - 仍在 running 但超过阈值未收到任何事件 → 触发兜底（卡片亮错 + 释放 question 状态）。
+   */
+  private async sweepIdleSessions(): Promise<void> {
+    if (!this.context || this.lastEventAtBySession.size === 0) return;
+    const { applyFailureToSession } = this.injectedDependencies();
+    const now = Date.now();
+    const expired: string[] = [];
+
+    for (const [sessionID, ts] of this.lastEventAtBySession.entries()) {
+      const chatId = chatSessionStore.getChatId(sessionID);
+      if (!chatId) {
+        expired.push(sessionID);
+        continue;
+      }
+      const route = this.resolveConversationRoute(sessionID, chatId);
+      const buffer = outputBuffer.get(route.bufferKey);
+      if (!buffer || buffer.status !== 'running') {
+        expired.push(sessionID);
+        continue;
+      }
+
+      if (now - ts <= OpenCodeEventHub.IDLE_TIMEOUT_MS) continue;
+
+      const idleSec = Math.round((now - ts) / 1000);
+      console.warn(`[OpenCodeEventHub] 会话 ${sessionID.slice(0, 8)}... 已 ${idleSec}s 无事件，触发空闲超时兜底`);
+
+      const minutes = Math.floor(OpenCodeEventHub.IDLE_TIMEOUT_MS / 60_000);
+      await applyFailureToSession(
+        sessionID,
+        `AI 推理超过 ${minutes} 分钟无响应，可能是工具调用参数解析失败。请重新提问。`
+      );
+
+      const pending = questionHandler.getBySession(sessionID);
+      if (pending) {
+        questionHandler.remove(pending.request.id);
+      }
+
+      expired.push(sessionID);
+    }
+
+    for (const sessionID of expired) {
+      this.lastEventAtBySession.delete(sessionID);
+    }
   }
 
   // ==================== 私有事件处理器 ====================
@@ -238,6 +318,8 @@ export class OpenCodeEventHub {
       setMessageCorrelation,
       upsertTimelineNote,
     } = this.injectedDependencies();
+
+    this.touchSessionActivity(event.sessionId);
 
     const resolution = resolvePermissionChat(event);
     const chatId = resolution.chatId;
@@ -497,6 +579,8 @@ export class OpenCodeEventHub {
     const status = eventObj?.status as Record<string, unknown> | undefined;
     if (!sessionID || !status || typeof status !== 'object') return;
 
+    this.touchSessionActivity(sessionID);
+
     const chatId = chatSessionStore.getChatId(sessionID);
     if (!chatId) return;
 
@@ -547,6 +631,7 @@ export class OpenCodeEventHub {
       outputBuffer.setStatus(bufferKey, 'completed');
     }
     this.clearUserMessageIds(sessionID);
+    this.lastEventAtBySession.delete(sessionID);
   }
 
   private async handleMessageUpdated(event: unknown): Promise<void> {
@@ -560,6 +645,8 @@ export class OpenCodeEventHub {
 
     const sessionID = toSessionId(info.sessionID);
     if (!sessionID) return;
+
+    this.touchSessionActivity(sessionID);
 
     const role = typeof info.role === 'string' ? info.role : '';
     if (role === 'user') {
@@ -604,6 +691,7 @@ export class OpenCodeEventHub {
     const text = formatProviderError(eventObj?.error);
     await applyFailureToSession(sessionID, text);
     this.clearUserMessageIds(sessionID);
+    this.lastEventAtBySession.delete(sessionID);
   }
 
   private handleMessagePartUpdated(event: unknown): void {
@@ -637,6 +725,8 @@ export class OpenCodeEventHub {
     const sessionID = toSessionId(eventObj?.sessionID || part?.sessionID);
     const delta = eventObj?.delta;
     if (!sessionID) return;
+
+    this.touchSessionActivity(sessionID);
 
     const partMessageId = typeof part?.messageID === 'string' ? part.messageID : '';
     if (partMessageId && this.isUserMessagePart(sessionID, partMessageId)) {
@@ -872,6 +962,8 @@ export class OpenCodeEventHub {
     const { chatSessionStore, questionHandler, outputBuffer, upsertTimelineNote } = this.injectedDependencies();
 
     const request = event as import('../opencode/question-handler.js').QuestionRequest;
+    this.touchSessionActivity(request.sessionID);
+
     const chatId = chatSessionStore.getChatId(request.sessionID);
 
     if (chatId) {
