@@ -20,6 +20,7 @@ const scriptDir = path.dirname(scriptFile);
 const rootDir = path.resolve(scriptDir, '..');
 const logsDir = path.join(rootDir, 'logs');
 const pidFile = path.join(logsDir, 'bridge.pid');
+const caffeinatePidFile = path.join(logsDir, 'caffeinate.pid');
 const outLog = path.join(logsDir, 'service.log');
 const errLog = path.join(logsDir, 'service.err');
 const adminEntryFile = path.join(rootDir, 'dist', 'admin', 'index.js');
@@ -138,6 +139,43 @@ function startAdmin() {
   fs.writeFileSync(pidFile, String(child.pid), 'utf-8');
   console.log(`[start] 启动成功，PID=${child.pid}`);
   console.log(`[start] 日志文件：${outLog}`);
+
+  spawnCaffeinate(child.pid);
+}
+
+// macOS 锁屏后系统会把 Node 进程整体挂起(App Nap),导致 SSE/WS 长连接被中断。
+// 用 caffeinate -is -w <bridgePid> 阻止 idle sleep,跟随 Bridge 进程生命周期:
+// Bridge 退出 → caffeinate 自动退出。仅 macOS 生效。
+// 注意:caffeinate 阻止不了 clamshell sleep(合上盖子)。
+function spawnCaffeinate(bridgePid) {
+  if (process.platform !== 'darwin') return;
+
+  // 清理旧的 caffeinate(防止多次重启遗留)
+  try {
+    const oldPidStr = fs.readFileSync(caffeinatePidFile, 'utf-8').trim();
+    const oldPid = Number.parseInt(oldPidStr, 10);
+    if (Number.isFinite(oldPid) && oldPid > 0) {
+      try {
+        process.kill(oldPid, 'SIGTERM');
+      } catch {
+        // 已不存在
+      }
+    }
+  } catch {
+    // 没有旧 pid 文件
+  }
+
+  try {
+    const caf = spawn('caffeinate', ['-is', '-w', String(bridgePid)], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    caf.unref();
+    fs.writeFileSync(caffeinatePidFile, String(caf.pid), 'utf-8');
+    console.log(`[start] 已启动 caffeinate (PID=${caf.pid}) 跟随 Bridge，锁屏后系统不会挂起 Node 进程`);
+  } catch (err) {
+    console.warn(`[start] 启动 caffeinate 失败，锁屏后服务可能被挂起：${err?.message ?? err}`);
+  }
 }
 
 function sleep(ms) {

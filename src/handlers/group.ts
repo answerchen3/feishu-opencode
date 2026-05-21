@@ -90,6 +90,12 @@ type OpencodeFilePartInput = { type: 'file'; mime: string; url: string; filename
 
 type OpencodePartInput = { type: 'text'; text: string } | OpencodeFilePartInput;
 
+// 飞书互动卡片长度约束提示（注入到每条用户消息末尾，作为独立 text part）。
+// 触发原因：飞书 schema 2.0 单卡片 JSON ~30KB / 单 markdown element ~5K 字符 / 嵌套层级有限；
+// 超限时服务端返回 230099 / 200800（"create universal card fail"），bridge 端会回退为最小卡片。
+// 注入此约束让模型主动控制输出长度，从源头避免触发回退。
+const FEISHU_OUTPUT_LENGTH_HINT = '[飞书渲染约束: 你的输出会渲染为飞书互动卡片，请控制总字符数 ≤ 6000，单段连续 markdown ≤ 1500，表格行数 ≤ 30，避免折叠面板 / 多列容器嵌套超过 2 层；内容确需超长时，请给出关键摘要 + 提示用户在 OpenCode Web 查看完整输出，不要硬塞长文。]';
+
 export type QuestionSkipActionResult = 'applied' | 'not_found' | 'stale_card' | 'invalid_state';
 
 export class GroupHandler {
@@ -399,6 +405,9 @@ export class GroupHandler {
       if (effectiveText) {
         parts.push({ type: 'text', text: effectiveText });
       }
+
+      // 注入飞书卡片长度约束（独立 text part，不与用户原文合并 → 不污染 prompt cache 中的用户消息）
+      parts.push({ type: 'text', text: FEISHU_OUTPUT_LENGTH_HINT });
 
       // ── 提前解析 providerId/modelId/directory ──
       // prepareAttachmentParts 需要这些上下文来判断主模型是否支持 image 输入，

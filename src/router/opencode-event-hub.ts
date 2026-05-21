@@ -132,7 +132,7 @@ export class OpenCodeEventHub {
   // 用于检测 OpenCode 后端因工具参数 JSON parse 失败等原因导致的「流式中断卡死」
   private lastEventAtBySession = new Map<string, number>();
   private idleSweepTimer: NodeJS.Timeout | null = null;
-  private static readonly IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+  private static readonly IDLE_TIMEOUT_MS = 10 * 60 * 1000;
   private static readonly IDLE_SWEEP_INTERVAL_MS = 30_000;
 
   private resolveConversationRoute(
